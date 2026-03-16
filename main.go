@@ -6,15 +6,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
-
-// The Magic Key: 9145 is the 2024 Australian Grand Prix Race (Fully Archived & Free)
-const targetSession = "9145"
 
 // --- 1. UI Styles ---
 var (
@@ -26,9 +24,17 @@ var (
 	p3Style = cardStyle.Copy().BorderForeground(lipgloss.Color("#CD7F32")).Foreground(lipgloss.Color("#CD7F32"))
 
 	statLabelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	selectedStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FF1801"))
 )
 
 // --- 2. Data Models & State ---
+type RaceSession struct {
+	Key         string
+	CountryName string
+	Year        int
+	DateStart   string
+}
+
 type DriverStats struct {
 	Number  int
 	Acronym string
@@ -41,6 +47,15 @@ type DriverStats struct {
 }
 
 type model struct {
+	// Race selector state
+	races       []RaceSession
+	racesCursor int
+
+	// Selected race
+	selectedSession string
+	selectedName    string
+
+	// Simulation state
 	stats    []DriverStats
 	err      error
 	phase    string
@@ -64,12 +79,14 @@ type dataMsg struct {
 }
 type errMsg error
 type retryBootMsg struct{}
+type racesMsg []RaceSession
+type racesErrMsg struct{ err error }
 
 var httpClient = &http.Client{Timeout: 15 * time.Second}
 
 // --- 3. Bubble Tea App Logic ---
 func initialModel() model {
-	return model{phase: "booting", width: 80, carX: 80}
+	return model{phase: "selecting", width: 80, carX: 80}
 }
 
 func animCmd() tea.Cmd {
@@ -79,7 +96,7 @@ func animCmd() tea.Cmd {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(fetchBootData, animCmd())
+	return tea.Batch(fetchRaces, animCmd())
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -96,21 +113,58 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, animCmd()
 
 	case tea.KeyMsg:
-		if msg.String() == "q" || msg.String() == "ctrl+c" {
+		switch msg.String() {
+		case "q", "ctrl+c":
 			return m, tea.Quit
+		case "up", "k":
+			if m.phase == "selecting" && m.racesCursor > 0 {
+				m.racesCursor--
+			}
+		case "down", "j":
+			if m.phase == "selecting" && m.racesCursor < len(m.races)-1 {
+				m.racesCursor++
+			}
+		case "enter", " ":
+			if m.phase == "selecting" && len(m.races) > 0 {
+				race := m.races[m.racesCursor]
+				m.selectedSession = race.Key
+				m.selectedName = fmt.Sprintf("%d %s", race.Year, race.CountryName)
+				m.phase = "booting"
+				m.err = nil
+				return m, fetchBootData(m.selectedSession)
+			} else if m.phase == "selecting" && m.err != nil {
+				m.err = nil
+				return m, fetchRaces
+			}
+		case "r":
+			if m.phase == "simulating" || (m.phase == "selecting" && m.err != nil) {
+				m.phase = "selecting"
+				m.races = nil
+				m.err = nil
+				return m, fetchRaces
+			}
 		}
+
+	case racesMsg:
+		m.races = []RaceSession(msg)
+		m.racesCursor = 0
+		return m, nil
+
+	case racesErrMsg:
+		m.err = msg.err
+		return m, nil
 
 	case bootMsg:
 		m.stats = msg.Stats
 		// Skip the first 65 minutes (pre-race grid & formation lap) to jump straight into the racing action
 		m.simClock = msg.StartTime.Add(65 * time.Minute)
 		m.phase = "simulating"
-		return m, tea.Batch(fetchSimData(m.stats, m.simClock), tickCmd())
+		return m, tea.Batch(fetchSimData(m.selectedSession, m.stats, m.simClock), tickCmd())
 
 	case tickMsg:
 		if m.phase == "simulating" {
 			m.tick = !m.tick
-			return m, tea.Batch(fetchSimData(m.stats, m.simClock), tickCmd())
+			return m, tea.Batch(fetchSimData(m.selectedSession, m.stats, m.simClock), tickCmd())
 		}
 
 	case dataMsg:
@@ -129,12 +183,36 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case retryBootMsg:
 		m.err = nil
-		return m, fetchBootData
+		return m, fetchBootData(m.selectedSession)
 	}
 	return m, nil
 }
 
 func (m model) View() string {
+	if m.phase == "selecting" {
+		if m.err != nil {
+			return fmt.Sprintf("Failed to load races: %v\n\nPress Enter or 'r' to retry · 'q' to quit.", m.err)
+		}
+		if len(m.races) == 0 {
+			return "Loading races...\n"
+		}
+		lines := []string{
+			titleStyle.Render("🏎️  F1 RACE SELECTOR"),
+			"",
+			"Select a race to simulate  (↑/↓ or j/k · Enter to select · q to quit)",
+			"",
+		}
+		for i, race := range m.races {
+			label := fmt.Sprintf("%d  %s GP", race.Year, race.CountryName)
+			if i == m.racesCursor {
+				lines = append(lines, selectedStyle.Render("▶ "+label))
+			} else {
+				lines = append(lines, "  "+label)
+			}
+		}
+		return strings.Join(lines, "\n")
+	}
+
 	carPos := m.carX
 	if carPos < 0 {
 		carPos = 0
@@ -145,7 +223,7 @@ func (m model) View() string {
 		if m.err != nil {
 			return fmt.Sprintf("%s\nAPI Error: %v\n\nRetrying in 5 seconds... (Press 'q' to quit)", carLine, m.err)
 		}
-		return fmt.Sprintf("%s\nFetching historical Australian GP data and preparing simulation...\n", carLine)
+		return fmt.Sprintf("%s\nFetching %s data and preparing simulation...\n", carLine, m.selectedName)
 	}
 
 	if len(m.stats) < 3 {
@@ -156,9 +234,9 @@ func (m model) View() string {
 	if m.tick {
 		liveIcon = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF00")).Render("●")
 	}
-	
+
 	simTimeStr := m.simClock.Format("15:04:05")
-	title := titleStyle.Render(fmt.Sprintf("🏎️  AUSTRALIAN GP SIMULATOR [%s UTC] %s", simTimeStr, liveIcon))
+	title := titleStyle.Render(fmt.Sprintf("🏎️  %s SIMULATOR [%s UTC] %s", strings.ToUpper(m.selectedName), simTimeStr, liveIcon))
 
 	cards := make([]string, 3)
 	styles := []lipgloss.Style{p1Style, p2Style, p3Style}
@@ -178,93 +256,153 @@ func (m model) View() string {
 	}
 
 	podium := lipgloss.JoinHorizontal(lipgloss.Bottom, cards[1], cards[0], cards[2])
-	return fmt.Sprintf("%s\n%s\n%s\n\nPress 'q' to quit.", carLine, title, podium)
+	return fmt.Sprintf("%s\n%s\n%s\n\nPress 'q' to quit | 'r' to change race", carLine, title, podium)
 }
 
-// --- 4. Boot Phase: Get Positions, Drivers, and Start Time ---
-func fetchBootData() tea.Msg {
-	// 1. Session Time
-	respSess, err := httpClient.Get("https://api.openf1.org/v1/sessions?session_key=" + targetSession)
-	if err != nil { return errMsg(err) }
-	defer respSess.Body.Close()
+// --- 4. Race Selector: Fetch Last 25 Races ---
+func fetchRaces() tea.Msg {
+	resp, err := httpClient.Get("https://api.openf1.org/v1/sessions?session_type=Race")
+	if err != nil {
+		return racesErrMsg{err}
+	}
+	defer resp.Body.Close()
 
-	if respSess.StatusCode != http.StatusOK {
-		return errMsg(fmt.Errorf("OpenF1 API returned %s for /sessions", respSess.Status))
+	if resp.StatusCode != http.StatusOK {
+		return racesErrMsg{fmt.Errorf("OpenF1 API returned %s for /sessions", resp.Status)}
 	}
 
-	var sessions []struct {
-		DateStart string `json:"date_start"`
+	var raw []struct {
+		SessionKey  int    `json:"session_key"`
+		CountryName string `json:"country_name"`
+		Year        int    `json:"year"`
+		DateStart   string `json:"date_start"`
 	}
-	if err := json.NewDecoder(respSess.Body).Decode(&sessions); err != nil || len(sessions) == 0 {
-		return errMsg(fmt.Errorf("could not parse session data"))
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return racesErrMsg{err}
 	}
-	
-	startTime, err := time.Parse(time.RFC3339Nano, sessions[0].DateStart)
-	if err != nil { return errMsg(err) }
 
-	// 2. Positions
-	respPos, err := httpClient.Get("https://api.openf1.org/v1/position?session_key=" + targetSession)
-	if err != nil { return errMsg(err) }
-	defer respPos.Body.Close()
+	sort.Slice(raw, func(i, j int) bool {
+		return raw[i].DateStart > raw[j].DateStart
+	})
 
-	var positions []struct {
-		DriverNumber int `json:"driver_number"`
-		Position     int `json:"position"`
+	limit := 25
+	if len(raw) < limit {
+		limit = len(raw)
 	}
-	if err := json.NewDecoder(respPos.Body).Decode(&positions); err != nil { return errMsg(err) }
 
-	currentPos := make(map[int]int)
-	found := 0
-	for i := len(positions) - 1; i >= 0; i-- {
-		p := positions[i]
-		if p.Position >= 1 && p.Position <= 3 {
-			if _, exists := currentPos[p.Position]; !exists {
-				currentPos[p.Position] = p.DriverNumber
-				found++
-				if found == 3 { break }
-			}
+	races := make([]RaceSession, limit)
+	for i := 0; i < limit; i++ {
+		races[i] = RaceSession{
+			Key:         fmt.Sprintf("%d", raw[i].SessionKey),
+			CountryName: raw[i].CountryName,
+			Year:        raw[i].Year,
+			DateStart:   raw[i].DateStart,
 		}
 	}
 
-	// 3. Driver Info
-	respInfo, err := httpClient.Get("https://api.openf1.org/v1/drivers?session_key=" + targetSession)
-	if err != nil { return errMsg(err) }
-	defer respInfo.Body.Close()
-
-	var driversInfo []struct {
-		DriverNumber int    `json:"driver_number"`
-		Acronym      string `json:"name_acronym"`
-		TeamName     string `json:"team_name"`
-	}
-	if err := json.NewDecoder(respInfo.Body).Decode(&driversInfo); err != nil { return errMsg(err) }
-
-	infoMap := make(map[int]struct{ Acronym, Team string })
-	for _, d := range driversInfo {
-		infoMap[d.DriverNumber] = struct{ Acronym, Team string }{d.Acronym, d.TeamName}
-	}
-
-	var initialStats []DriverStats
-	for i := 1; i <= 3; i++ {
-		dNum := currentPos[i]
-		info := infoMap[dNum]
-		initialStats = append(initialStats, DriverStats{
-			Number:  dNum,
-			Acronym: info.Acronym,
-			Team:    info.Team,
-		})
-	}
-
-	return bootMsg{Stats: initialStats, StartTime: startTime}
+	return racesMsg(races)
 }
 
-// --- 5. Simulation Phase: 7-Second Ticks ---
+// --- 5. Boot Phase: Get Positions, Drivers, and Start Time ---
+func fetchBootData(sessionKey string) tea.Cmd {
+	return func() tea.Msg {
+		// 1. Session Time
+		respSess, err := httpClient.Get("https://api.openf1.org/v1/sessions?session_key=" + sessionKey)
+		if err != nil {
+			return errMsg(err)
+		}
+		defer respSess.Body.Close()
+
+		if respSess.StatusCode != http.StatusOK {
+			return errMsg(fmt.Errorf("OpenF1 API returned %s for /sessions", respSess.Status))
+		}
+
+		var sessions []struct {
+			DateStart string `json:"date_start"`
+		}
+		if err := json.NewDecoder(respSess.Body).Decode(&sessions); err != nil || len(sessions) == 0 {
+			return errMsg(fmt.Errorf("could not parse session data"))
+		}
+
+		startTime, err := time.Parse(time.RFC3339Nano, sessions[0].DateStart)
+		if err != nil {
+			return errMsg(err)
+		}
+
+		// 2. Positions
+		respPos, err := httpClient.Get("https://api.openf1.org/v1/position?session_key=" + sessionKey)
+		if err != nil {
+			return errMsg(err)
+		}
+		defer respPos.Body.Close()
+
+		var positions []struct {
+			DriverNumber int `json:"driver_number"`
+			Position     int `json:"position"`
+		}
+		if err := json.NewDecoder(respPos.Body).Decode(&positions); err != nil {
+			return errMsg(err)
+		}
+
+		currentPos := make(map[int]int)
+		found := 0
+		for i := len(positions) - 1; i >= 0; i-- {
+			p := positions[i]
+			if p.Position >= 1 && p.Position <= 3 {
+				if _, exists := currentPos[p.Position]; !exists {
+					currentPos[p.Position] = p.DriverNumber
+					found++
+					if found == 3 {
+						break
+					}
+				}
+			}
+		}
+
+		// 3. Driver Info
+		respInfo, err := httpClient.Get("https://api.openf1.org/v1/drivers?session_key=" + sessionKey)
+		if err != nil {
+			return errMsg(err)
+		}
+		defer respInfo.Body.Close()
+
+		var driversInfo []struct {
+			DriverNumber int    `json:"driver_number"`
+			Acronym      string `json:"name_acronym"`
+			TeamName     string `json:"team_name"`
+		}
+		if err := json.NewDecoder(respInfo.Body).Decode(&driversInfo); err != nil {
+			return errMsg(err)
+		}
+
+		infoMap := make(map[int]struct{ Acronym, Team string })
+		for _, d := range driversInfo {
+			infoMap[d.DriverNumber] = struct{ Acronym, Team string }{d.Acronym, d.TeamName}
+		}
+
+		var initialStats []DriverStats
+		for i := 1; i <= 3; i++ {
+			dNum := currentPos[i]
+			info := infoMap[dNum]
+			initialStats = append(initialStats, DriverStats{
+				Number:  dNum,
+				Acronym: info.Acronym,
+				Team:    info.Team,
+			})
+		}
+
+		return bootMsg{Stats: initialStats, StartTime: startTime}
+	}
+}
+
+// --- 6. Simulation Phase: 7-Second Ticks ---
 func tickCmd() tea.Cmd {
 	return tea.Tick(time.Second*7, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
 }
 
-func fetchSimData(currentStats []DriverStats, currentClock time.Time) tea.Cmd {
+func fetchSimData(sessionKey string, currentStats []DriverStats, currentClock time.Time) tea.Cmd {
 	return func() tea.Msg {
 		results := make([]DriverStats, len(currentStats))
 		copy(results, currentStats)
@@ -273,7 +411,7 @@ func fetchSimData(currentStats []DriverStats, currentClock time.Time) tea.Cmd {
 		timeFilter := fmt.Sprintf("&date>=%s&date<%s", url.QueryEscape(currentClock.Format(time.RFC3339Nano)), url.QueryEscape(endTime.Format(time.RFC3339Nano)))
 
 		// 1. CAR DATA
-		urlCar := "https://api.openf1.org/v1/car_data?session_key=" + targetSession + timeFilter
+		urlCar := "https://api.openf1.org/v1/car_data?session_key=" + sessionKey + timeFilter
 		if resp, err := httpClient.Get(urlCar); err == nil && resp.StatusCode == 200 {
 			var data []struct {
 				DriverNumber int `json:"driver_number"`
@@ -297,7 +435,7 @@ func fetchSimData(currentStats []DriverStats, currentClock time.Time) tea.Cmd {
 		}
 
 		// 2. INTERVALS
-		urlInt := "https://api.openf1.org/v1/intervals?session_key=" + targetSession + timeFilter
+		urlInt := "https://api.openf1.org/v1/intervals?session_key=" + sessionKey + timeFilter
 		if resp, err := httpClient.Get(urlInt); err == nil && resp.StatusCode == 200 {
 			var iData []struct {
 				DriverNumber int     `json:"driver_number"`
@@ -317,7 +455,7 @@ func fetchSimData(currentStats []DriverStats, currentClock time.Time) tea.Cmd {
 		}
 
 		// 3. LAPS
-		urlLap := fmt.Sprintf("https://api.openf1.org/v1/laps?session_key=%s&date_start>=%s&date_start<%s", targetSession, url.QueryEscape(currentClock.Format(time.RFC3339Nano)), url.QueryEscape(endTime.Format(time.RFC3339Nano)))
+		urlLap := fmt.Sprintf("https://api.openf1.org/v1/laps?session_key=%s&date_start>=%s&date_start<%s", sessionKey, url.QueryEscape(currentClock.Format(time.RFC3339Nano)), url.QueryEscape(endTime.Format(time.RFC3339Nano)))
 		if resp, err := httpClient.Get(urlLap); err == nil && resp.StatusCode == 200 {
 			var lData []struct {
 				DriverNumber int     `json:"driver_number"`
@@ -340,7 +478,7 @@ func fetchSimData(currentStats []DriverStats, currentClock time.Time) tea.Cmd {
 	}
 }
 
-// --- 6. Entry Point ---
+// --- 7. Entry Point ---
 func main() {
 	p := tea.NewProgram(initialModel())
 	if _, err := p.Run(); err != nil {

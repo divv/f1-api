@@ -1,21 +1,62 @@
-# Execution Summary
+# Execute Summary: Race Selector Menu
 
 ## Changes
 
-**`main.go`** — all changes in a single file:
+### `main.go` — sole file modified
 
-- Added `"strings"` to imports
-- Added `width int` and `carX int` fields to `model` struct to track terminal width and car X position
-- Added `animTickMsg` message type for the 60ms animation timer
-- Added `animCmd()` function that fires every 60ms
-- Updated `initialModel()` to set `width: 80, carX: 80` as defaults
-- Updated `Init()` to `tea.Batch(fetchBootData, animCmd())` so animation starts immediately
-- Added `tea.WindowSizeMsg` handler in `Update` to track real terminal width
-- Added `animTickMsg` handler in `Update`: decrements `carX` each tick; wraps back to `m.width` when it goes below -2 (fully off-screen left)
-- Updated `View()` to compute `carLine` (spaces + `🏎` emoji) and prepend it to all view states (booting, simulating)
+**Imports added:** `"sort"`, `"strings"`
+
+**Removed:** `const targetSession = "9145"` (hardcoded session)
+
+**New styles added:**
+- `selectedStyle` — bold red, used to highlight the cursor row in the race selector list
+
+**New types added:**
+- `RaceSession` — holds `Key`, `CountryName`, `Year`, `DateStart` for a race
+- `racesMsg []RaceSession` — message carrying the fetched race list
+- `racesErrMsg{err}` — message for fetch failures
+
+**`model` struct — new fields:**
+- `races []RaceSession` — list shown in the selector
+- `racesCursor int` — which row is highlighted
+- `selectedSession string` — session key of the chosen race
+- `selectedName string` — human-readable race name for the simulation title
+
+**`initialModel()`** — now returns `phase: "selecting"` instead of `"booting"`
+
+**`Init()`** — now calls `fetchRaces` instead of the old `fetchBootData`
+
+**`Update()` changes:**
+- Key `q`/`ctrl+c` → quit (always)
+- Keys `up`/`k`, `down`/`j` → move cursor in selecting phase
+- Key `enter`/` ` → confirm selection, transition to `"booting"`, call `fetchBootData(sessionKey)`
+- Key `r` → from simulating phase, return to selecting, re-fetch races
+- New case `racesMsg` → store races, reset cursor
+- New case `racesErrMsg` → store error for display
+- `bootMsg` handler → calls `fetchSimData(m.selectedSession, ...)` (was global const)
+- `tickMsg` handler → calls `fetchSimData(m.selectedSession, ...)` (was global const)
+- `retryBootMsg` handler → calls `fetchBootData(m.selectedSession)` (was global const)
+
+**`View()` changes:**
+- New `"selecting"` branch: loading indicator, error display, scrollable list with `▶` cursor
+- `"booting"` branch: now shows `m.selectedName` in the status text
+- Simulation title now uses `strings.ToUpper(m.selectedName)` instead of `"AUSTRALIAN GP"`
+- Footer now reads `Press 'q' to quit | 'r' to change race`
+
+**`fetchRaces()` — new function:**
+- Calls `GET /v1/sessions?session_type=Race`
+- Decodes JSON with `session_key` as `int` (actual API type)
+- Sorts by `DateStart` descending, takes first 25
+- Returns `racesMsg`
+
+**`fetchBootData`** — changed from `tea.Cmd` value to factory `func(sessionKey string) tea.Cmd`; all internal URL strings use `sessionKey` param
+
+**`fetchSimData`** — added `sessionKey string` as first parameter; all internal URL strings use `sessionKey` param
 
 ## Testing
 
-- `go build ./...` — compiles cleanly, no errors or warnings
-- Logic review: car starts at `carX = width` (right edge), moves left by 1 column per 60ms tick (~16 columns/second on an 80-col terminal, full pass ≈ 5 seconds), wraps seamlessly back to the right edge after it exits the left side
-- `tea.WindowSizeMsg` keeps the track width accurate on resize
+- `go build ./...` — clean compile, zero errors or warnings
+- Logic review: state transitions `selecting → booting → simulating → (r) → selecting` all wired correctly
+- Session key integer-to-string conversion handled explicitly in `fetchRaces` via `fmt.Sprintf("%d", ...)`
+- Hotkey `r` is only active in `"simulating"` phase (guard in Update)
+- Enter is only active in `"selecting"` phase with non-empty `races` (guard in Update)
