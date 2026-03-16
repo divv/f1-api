@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -63,6 +64,7 @@ type model struct {
 	simClock time.Time
 	width    int
 	carX     int
+	tickHz   float64 // simulation tick rate in Hz
 }
 
 // Messages
@@ -86,7 +88,11 @@ var httpClient = &http.Client{Timeout: 15 * time.Second}
 
 // --- 3. Bubble Tea App Logic ---
 func initialModel() model {
-	return model{phase: "selecting", width: 80, carX: 80}
+	return model{phase: "selecting", width: 80, carX: 80, tickHz: 0.5}
+}
+
+func (m model) interval() time.Duration {
+	return time.Duration(float64(time.Second) / m.tickHz)
 }
 
 func animCmd() tea.Cmd {
@@ -143,6 +149,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.err = nil
 				return m, fetchRaces
 			}
+		case "+", "=":
+			if m.tickHz < 2.0 {
+				m.tickHz = math.Round((m.tickHz+0.25)*100) / 100
+			}
+		case "-":
+			if m.tickHz > 0.25 {
+				m.tickHz = math.Round((m.tickHz-0.25)*100) / 100
+			}
 		}
 
 	case racesMsg:
@@ -159,12 +173,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Skip the first 65 minutes (pre-race grid & formation lap) to jump straight into the racing action
 		m.simClock = msg.StartTime.Add(65 * time.Minute)
 		m.phase = "simulating"
-		return m, tea.Batch(fetchSimData(m.selectedSession, m.stats, m.simClock), tickCmd())
+		return m, tea.Batch(fetchSimData(m.selectedSession, m.stats, m.simClock, m.interval()), tickCmd(m.interval()))
 
 	case tickMsg:
 		if m.phase == "simulating" {
 			m.tick = !m.tick
-			return m, tea.Batch(fetchSimData(m.selectedSession, m.stats, m.simClock), tickCmd())
+			return m, tea.Batch(fetchSimData(m.selectedSession, m.stats, m.simClock, m.interval()), tickCmd(m.interval()))
 		}
 
 	case dataMsg:
@@ -236,7 +250,7 @@ func (m model) View() string {
 	}
 
 	simTimeStr := m.simClock.Format("15:04:05")
-	title := titleStyle.Render(fmt.Sprintf("🏎️  %s SIMULATOR [%s UTC] %s", strings.ToUpper(m.selectedName), simTimeStr, liveIcon))
+	title := titleStyle.Render(fmt.Sprintf("🏎️  %s SIMULATOR [%s UTC] [%.2f Hz] %s", strings.ToUpper(m.selectedName), simTimeStr, m.tickHz, liveIcon))
 
 	cards := make([]string, 3)
 	styles := []lipgloss.Style{p1Style, p2Style, p3Style}
@@ -256,7 +270,7 @@ func (m model) View() string {
 	}
 
 	podium := lipgloss.JoinHorizontal(lipgloss.Bottom, cards[1], cards[0], cards[2])
-	return fmt.Sprintf("%s\n%s\n%s\n\nPress 'q' to quit | 'r' to change race", carLine, title, podium)
+	return fmt.Sprintf("%s\n%s\n%s\n\nPress 'q' to quit | 'r' to change race | +/- to adjust speed", carLine, title, podium)
 }
 
 // --- 4. Race Selector: Fetch Last 25 Races ---
@@ -395,19 +409,19 @@ func fetchBootData(sessionKey string) tea.Cmd {
 	}
 }
 
-// --- 6. Simulation Phase: 7-Second Ticks ---
-func tickCmd() tea.Cmd {
-	return tea.Tick(time.Second*7, func(t time.Time) tea.Msg {
+// --- 6. Simulation Phase ---
+func tickCmd(interval time.Duration) tea.Cmd {
+	return tea.Tick(interval, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
 }
 
-func fetchSimData(sessionKey string, currentStats []DriverStats, currentClock time.Time) tea.Cmd {
+func fetchSimData(sessionKey string, currentStats []DriverStats, currentClock time.Time, interval time.Duration) tea.Cmd {
 	return func() tea.Msg {
 		results := make([]DriverStats, len(currentStats))
 		copy(results, currentStats)
 
-		endTime := currentClock.Add(7 * time.Second)
+		endTime := currentClock.Add(interval)
 		timeFilter := fmt.Sprintf("&date>=%s&date<%s", url.QueryEscape(currentClock.Format(time.RFC3339Nano)), url.QueryEscape(endTime.Format(time.RFC3339Nano)))
 
 		// 1. CAR DATA
