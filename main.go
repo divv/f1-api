@@ -61,9 +61,12 @@ type model struct {
 	phase    string
 	tick     bool
 	simClock time.Time
+	width    int
+	carX     int
 }
 
 // Messages
+type animTickMsg struct{}
 type tickMsg time.Time
 type bootData struct {
 	Stats     []DriverStats
@@ -83,15 +86,32 @@ var httpClient = &http.Client{Timeout: 15 * time.Second}
 
 // --- 3. Bubble Tea App Logic ---
 func initialModel() model {
-	return model{phase: "selecting"}
+	return model{phase: "selecting", width: 80, carX: 80}
+}
+
+func animCmd() tea.Cmd {
+	return tea.Tick(60*time.Millisecond, func(time.Time) tea.Msg {
+		return animTickMsg{}
+	})
 }
 
 func (m model) Init() tea.Cmd {
-	return fetchRaces
+	return tea.Batch(fetchRaces, animCmd())
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		return m, nil
+
+	case animTickMsg:
+		m.carX--
+		if m.carX < -2 {
+			m.carX = m.width
+		}
+		return m, animCmd()
+
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
@@ -193,11 +213,17 @@ func (m model) View() string {
 		return strings.Join(lines, "\n")
 	}
 
+	carPos := m.carX
+	if carPos < 0 {
+		carPos = 0
+	}
+	carLine := strings.Repeat(" ", carPos) + "🏎"
+
 	if m.phase == "booting" {
 		if m.err != nil {
-			return fmt.Sprintf("API Error: %v\n\nRetrying in 5 seconds... (Press 'q' to quit)", m.err)
+			return fmt.Sprintf("%s\nAPI Error: %v\n\nRetrying in 5 seconds... (Press 'q' to quit)", carLine, m.err)
 		}
-		return fmt.Sprintf("Fetching %s data and preparing simulation...\n", m.selectedName)
+		return fmt.Sprintf("%s\nFetching %s data and preparing simulation...\n", carLine, m.selectedName)
 	}
 
 	if len(m.stats) < 3 {
@@ -230,7 +256,7 @@ func (m model) View() string {
 	}
 
 	podium := lipgloss.JoinHorizontal(lipgloss.Bottom, cards[1], cards[0], cards[2])
-	return fmt.Sprintf("%s\n%s\n\nPress 'q' to quit | 'r' to change race", title, podium)
+	return fmt.Sprintf("%s\n%s\n%s\n\nPress 'q' to quit | 'r' to change race", carLine, title, podium)
 }
 
 // --- 4. Race Selector: Fetch Last 25 Races ---
